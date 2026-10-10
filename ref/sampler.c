@@ -238,11 +238,11 @@ void noise_magnitude_batch(int32_t *m_out, const uint8_t *rand,
  *   z0     = ct_is_zero(cand)           (the z==0 fold branch)
  *
  * Zero-fold (spec step 7): a z==0 candidate value 0 is identical for both
- * signs, so emitting it for BOTH would double its mass.  We keep it only
- * when the OUTPUT sign bit is 0 (probability 1/2), which is mass-correct
- * and needs NO extra byte.  For z != 0 the sign bit just chooses +/-.
+ * signs, so emitting it for BOTH would double its mass.  The independent
+ * candidate fold bit supplies the required 1/2 decision.  For z != 0 the
+ * output sign bit only chooses +/-.
  *
- *   keep   = accept & ~(z0 & sign_bit)
+ *   keep   = accept & ~(z0 & fold_bit)
  *   *out   = ct_sel_i32(sign_bit, -cand, cand)
  *
  * All operations are data-independent (the only data-dependent quantity
@@ -270,14 +270,15 @@ static uint64_t load_le64(const uint8_t *p)
 }
 
 int gauss_finalize(int32_t *out, int32_t x, int32_t y, uint64_t p_hat,
-                   const uint8_t tail[8], uint32_t sign_bit)
+                   const uint8_t tail[8], uint32_t sign_bit,
+                   uint32_t fold_bit)
 {
     int32_t cand = WIDE_K * x + y; /* 256x + y */
     uint64_t u = load_le64(tail);  /* full 64-bit Bernoulli draw */
     uint32_t accept = (uint32_t)ct_lt_u64(u, p_hat); /* u < p_hat */
     uint32_t z0 = ct_is_zero_u32((uint32_t)cand);    /* cand == 0 */
-    /* zero-fold: drop a z==0 candidate when sign_bit == 1 (half it). */
-    uint32_t keep = accept & (1u ^ (z0 & (sign_bit & 1u)));
+    /* zero-fold uses the independent candidate-indexed fold bit. */
+    uint32_t keep = accept & (1u ^ (z0 & (fold_bit & 1u)));
     *out = ct_sel_i32(sign_bit & 1u, -cand, cand);
     return (int)keep;
 }

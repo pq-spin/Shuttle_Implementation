@@ -6,7 +6,7 @@ Byte/value-exact to:
   - ref/approx_exp.h / tools/approx_exp_poly.h  (shuttle_exp_accept_poly_q64)
   - ref/sampler.c                               (gauss_finalize, the zero-fold)
   - ref/polyvec.c  gauss_stream_chunk / noise_minibatch  (the mini-batch byte
-    schedule with the up-front sign / tail blocks, K6/K8/K9)
+    schedule with the up-front sign/padding block and appended fold bits, K6/K8/K9)
 
 The ApproxExp coefficients are parsed from the committed
 tools/approx_exp_poly.h (no re-derivation -> no new magic numbers).  The
@@ -80,16 +80,16 @@ def _ct_lt_u64(a, b):
     return 1 if (a & _M64) < (b & _M64) else 0
 
 
-def gauss_finalize(x, y, p_hat, tail8, sign_bit):
+def gauss_finalize(x, y, p_hat, tail8, sign_bit, fold_bit=0):
     """Mirror ref/sampler.c gauss_finalize.  Returns (keep, out_coeff).
     cand = 256*x + y; accept iff LE64(tail) < p_hat; z==0 zero-fold drops a
-    cand==0 candidate when the OUTPUT sign bit is 1 (halves the 0 mass)."""
+    cand==0 candidate when the independent fold bit is 1 (halves the 0 mass)."""
     WIDE_K = 256
     cand = WIDE_K * x + y                        # int32 256x+y (small int)
     u = int.from_bytes(bytes(tail8), "little")
     accept = _ct_lt_u64(u, p_hat)
     z0 = 1 if cand == 0 else 0
-    keep = accept & (1 ^ (z0 & (sign_bit & 1)))
+    keep = accept & (1 ^ (z0 & (fold_bit & 1)))
     out = -cand if (sign_bit & 1) else cand
     return keep, out
 
@@ -134,6 +134,9 @@ SIGMA_S_RAND_BYTES = 384
 Y_RAND_BYTES = 32
 GAUSS_RAND_BYTES = 8
 MINIBATCH_RAND_BYTES = SIGMA_S_RAND_BYTES + Y_RAND_BYTES + GAUSS_BATCH * GAUSS_RAND_BYTES  # 672
+SAMPLE_Y_FOLD_BYTES = GAUSS_BATCH // 8
+SAMPLE_Y_RAND_BYTES = MINIBATCH_RAND_BYTES + SAMPLE_Y_FOLD_BYTES  # 676
+SAMPLE_Y_PADDING_BYTES = 8
 
 
 def gauss_chunk(gs, count, Z):
@@ -145,12 +148,14 @@ def gauss_chunk(gs, count, Z):
     # candidate loop reads signs[coefcnt>>3] even after coefcnt reaches count
     # (the remaining j's of the last mini-batch), so pad here to mirror it.
     signbytes = (count + 7) // 8
-    gs.ensure(signbytes)
+    # First block also includes fixed padding before the first candidate batch.
+    gs.ensure(signbytes + SAMPLE_Y_PADDING_BYTES)
     signs = bytes(gs.buf[gs.pos:gs.pos + signbytes]) + bytes(8)
-    gs.pos += signbytes
+    gs.pos += signbytes + SAMPLE_Y_PADDING_BYTES
     coefcnt = 0
+    dummy = count - (1 if count != 0 else 0)
     while coefcnt < count:
-        gs.ensure(MINIBATCH_RAND_BYTES)
+        gs.ensure(SAMPLE_Y_RAND_BYTES)
         pos = gs.pos
         buf = gs.buf
         x = cdt_scan96(bytes(buf[pos:pos + SIGMA_S_RAND_BYTES]), Z, 36, GAUSS_BATCH)
@@ -158,16 +163,18 @@ def gauss_chunk(gs, count, Z):
         yv = [buf[yp + j] for j in range(GAUSS_BATCH)]        # Y_BITS=8 byte copy
         phat = [approx_exp_accept_q64(x[j], yv[j]) for j in range(GAUSS_BATCH)]
         tailp = pos + SIGMA_S_RAND_BYTES + Y_RAND_BYTES
+        foldp = pos + MINIBATCH_RAND_BYTES
         for j in range(GAUSS_BATCH):
-            idx = coefcnt                                     # OUTPUT index
+            idx = dummy if coefcnt == count else coefcnt       # safe sign index
             sgn = (signs[idx >> 3] >> (idx & 7)) & 1
             t0 = tailp + j * GAUSS_RAND_BYTES
-            keep, r = gauss_finalize(x[j], yv[j], phat[j], buf[t0:t0 + 8], sgn)
+            fold = (buf[foldp + (j >> 3)] >> (j & 7)) & 1
+            keep, r = gauss_finalize(x[j], yv[j], phat[j], buf[t0:t0 + 8], sgn, fold)
             if keep:
                 if coefcnt < count:
                     dst.append(r)
                     coefcnt += 1
-        gs.pos += MINIBATCH_RAND_BYTES
+        gs.pos += SAMPLE_Y_RAND_BYTES
     return dst
 
 
@@ -180,8 +187,8 @@ def _selftest():
     # exp at the minimum (x=36,y=255) is a small positive value < 2^64.
     pmin = approx_exp_accept_q64(36, 255)
     assert 0 < pmin < (1 << 62), hex(pmin)
-    # zero-fold: cand=0, sign=1 -> drop even if accept.
-    keep, out = gauss_finalize(0, 0, _M64, bytes(8), 1)
+    # zero-fold: cand=0, fold=1 -> drop even if accept.
+    keep, out = gauss_finalize(0, 0, _M64, bytes(8), 1, 1)
     assert keep == 0 and out == 0
     keep, out = gauss_finalize(0, 0, _M64, bytes(8), 0)
     assert keep == 1 and out == 0

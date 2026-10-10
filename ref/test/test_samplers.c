@@ -418,31 +418,36 @@ static int test_batch_eq_scalar(void)
         memset(signs, 0, sizeof(signs));
         gs_ensure(&gs, signbytes);
         memcpy(signs, gs.buf + gs.pos, signbytes);
-        gs.pos += signbytes;
+        gs.pos += signbytes + SAMPLE_Y_PADDING_BYTES;
         while (coefcnt < wy) {
             int32_t x[GAUSS_BATCH];
-            const uint8_t *yp, *tailp;
+            const uint8_t *yp, *tailp, *foldp;
             int j;
-            gs_ensure(&gs, MINIBATCH_RAND_BYTES);
+            gs_ensure(&gs, SAMPLE_Y_RAND_BYTES);
             sampler_sigma2(x, gs.buf + gs.pos);
             yp = gs.buf + gs.pos + SIGMA_S_RAND_BYTES;
             tailp = gs.buf + gs.pos + SIGMA_S_RAND_BYTES + Y_RAND_BYTES;
+            foldp = gs.buf + gs.pos + MINIBATCH_RAND_BYTES;
             for (j = 0; j < GAUSS_BATCH; j++) {
                 int xi = (int)x[j], yi = (int)yp[j];
                 uint64_t ph =
                     approx_exp_accept_q64(xi, yi); /* scalar x1 */
                 int32_t r;
-                size_t idx = coefcnt;
+                uint32_t done = ct_is_zero_u32((uint32_t)(wy - coefcnt));
+                uint32_t d = (uint32_t)ct_sel_i32(
+                    done, (int32_t)(wy - 1), (int32_t)coefcnt);
                 uint32_t sgn =
-                    (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
+                    (uint32_t)(signs[d >> 3] >> (d & 7)) & 1u;
+                uint32_t fold =
+                    (uint32_t)(foldp[j >> 3] >> (j & 7)) & 1u;
                 if (gauss_finalize(&r, x[j], (int32_t)yi, ph,
                                    tailp + (size_t)j * GAUSS_RAND_BYTES,
-                                   sgn)) {
+                                    sgn, fold) && coefcnt < wy) {
                     if (coefcnt < wy)
                         scal[coefcnt++] = r;
                 }
             }
-            gs.pos += MINIBATCH_RAND_BYTES;
+            gs.pos += SAMPLE_Y_RAND_BYTES;
         }
     }
     if (memcmp(batch, scal, wy * sizeof(int32_t)) != 0) {
@@ -497,10 +502,15 @@ static int test_cursor_determinism(void)
         printf("    MINIBATCH_RAND_BYTES macro inconsistent\n");
         fail = 1;
     }
+    if (SAMPLE_Y_RAND_BYTES != MINIBATCH_RAND_BYTES + SAMPLE_Y_FOLD_BYTES ||
+        SAMPLE_Y_FOLD_BYTES != GAUSS_BATCH / 8) {
+        printf("    SampleY fold-byte budget inconsistent\n");
+        fail = 1;
+    }
     printf(
         "    ExpandS byte-deterministic re-run; mini-batch tails "
         "fixed (noise=%d, wide=%d bytes)\n",
-        (int)NOISE_MINIBATCH_RAND_BYTES, (int)MINIBATCH_RAND_BYTES);
+        (int)NOISE_MINIBATCH_RAND_BYTES, (int)SAMPLE_Y_RAND_BYTES);
     return fail;
 }
 
@@ -534,6 +544,7 @@ static int test_finalize_batch_eq_scalar(void)
         uint64_t phat[GAUSS_BATCH];
         uint8_t tail[GAUSS_BATCH * 8];
         uint8_t sgnbit[GAUSS_BATCH];
+        uint8_t foldbit[GAUSS_BATCH];
         int32_t cand[GAUSS_BATCH], negc[GAUSS_BATCH];
         int32_t acc[GAUSS_BATCH], z0[GAUSS_BATCH];
         int j, k;
@@ -542,6 +553,7 @@ static int test_finalize_batch_eq_scalar(void)
             x[j] = (int32_t)(r % 37);           /* x in [0,36]  */
             y[j] = (int32_t)((r >> 8) & 0xFFu); /* y in [0,255] */
             sgnbit[j] = (uint8_t)((r >> 17) & 1u);
+            foldbit[j] = (uint8_t)((r >> 18) & 1u);
             /* p_hat: mix full-range draws with the Bernoulli hard edges.
              */
             {
@@ -581,12 +593,13 @@ static int test_finalize_batch_eq_scalar(void)
         for (j = 0; j < GAUSS_BATCH; j++) {
             int32_t r_s;
             uint32_t sgn = sgnbit[j] & 1u;
+            uint32_t fold = foldbit[j] & 1u;
             int keep_s = gauss_finalize(&r_s, x[j], y[j], phat[j],
-                                        tail + (size_t)j * 8, sgn);
+                                        tail + (size_t)j * 8, sgn, fold);
             /* reconstruct the SIMD keep + value with the SAME sign logic
              */
             uint32_t keep_v =
-                (uint32_t)acc[j] & (1u ^ ((uint32_t)z0[j] & sgn));
+                (uint32_t)acc[j] & (1u ^ ((uint32_t)z0[j] & fold));
             int32_t r_v = sgn ? negc[j] : cand[j];
             if ((int)keep_v != keep_s || r_v != r_s) {
                 if (mism < 8)

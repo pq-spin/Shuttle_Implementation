@@ -13,7 +13,8 @@
  *     sample_y              (DS 0x08, xof256, 16 lanes; wide Gaussian r)
  *
  * It pins the exact per-attempt PRNG byte schedule, the 16-lane stream
- * partition, the OUTPUT-indexed sign stream, the cursor-advance
+ * partition, the OUTPUT-indexed sign stream, the candidate-indexed fold
+ * stream, the cursor-advance
  * determinism rule, and the batch-orchestration plumbing
  * (gauss_stream) so that ref == avx2 == avx512 is byte-exact within each
  * MODE.  It is the KAT-fragile heart of the scheme.
@@ -147,31 +148,28 @@ void sample_y(poly y[KVEC], const uint8_t seedY[SEEDBYTES]);
 
 /* ---- Right-sized per-squeeze block (no over-squeezed tail) ------------
  * * Each gauss_stream block is one xof256 squeeze of
- * gauss_block_bytes(tag) bytes off the persisted per-lane ctx; consumption
+ * the fill-indexed gauss block bytes off the persisted per-lane ctx; consumption
  * reads contiguous regions of that one squeeze.  The block is the EXACT
  * minimum that holds one logical unit (one mini-batch, plus the sign
  * stream on the first block), with no magic slack:
  *
  *   SampleY (tag 0x08): one GAUSS_BATCH mini-batch is
- * MINIBATCH_RAND_BYTES. The FIRST block ALSO holds the up-front
- * OUTPUT-indexed sign stream (SIGN_BYTES_PER_CHUNK bytes, + the AVX512
- * LE64 over-read pad) ahead of the first mini-batch, so the block must
- * cover SIGN_BYTES_PER_CHUNK + SIGN_PAD_AVX512 + MINIBATCH_RAND_BYTES;
- * that is also enough for every later block (which holds exactly one
- * mini-batch after the small leftover is memmoved to the front -- never
- * enough to skip a squeeze, so one consume per block). ExpandS (tag 0x03):
+ * SAMPLE_Y_RAND_BYTES. The FIRST block ALSO holds the up-front
+ * OUTPUT-indexed sign stream (SIGN_BYTES_PER_CHUNK bytes) and the fixed
+ * eight-byte padding before the first mini-batch; later blocks hold exactly
+ * one 676-byte candidate batch. ExpandS (tag 0x03):
  * one noise mini-batch is NOISE_MINIBATCH_RAND_BYTES, consumed whole per
  * block -- the block is exactly that.
  *
- * The per-squeeze block size is byte-determining under NGCC, so it is the
- * SAME fixed size on every squeeze of the chain and is PINNED identically
- * across ref/avx2/avx512.  GAUSS_STREAM_BLOCK is the larger of the two
+ * The initial SampleY squeeze includes the sign/padding prefix; later squeezes
+ * contain one 676-byte candidate batch; ExpandS keeps its fixed 392-byte unit.
+ * These sizes are pinned identically across ref/avx2/avx512.  GAUSS_STREAM_BLOCK is the larger of the two
  * (the buffer/fill unit shared by ref and the N-way SIMD fill);
- * gauss_block_bytes() picks the tag-tuned size at fill time.  Buffer =
+ * gauss_block_bytes(tag, fill_index) picks the tag- and fill-indexed size.  Buffer =
  * 2*block: one freshly drawn block plus the memmoved leftover of the
  * previous one. */
 #define GAUSS_BLOCK_Y \
-    ((size_t)SIGN_BYTES_PER_CHUNK + SIGN_PAD_AVX512 + MINIBATCH_RAND_BYTES)
+    ((size_t)SIGN_BYTES_PER_CHUNK + SAMPLE_Y_PADDING_BYTES + SAMPLE_Y_RAND_BYTES)
 #define GAUSS_BLOCK_S ((size_t)NOISE_MINIBATCH_RAND_BYTES)
 #define GAUSS_STREAM_BLOCK \
     (GAUSS_BLOCK_Y > GAUSS_BLOCK_S ? GAUSS_BLOCK_Y : GAUSS_BLOCK_S)
@@ -181,6 +179,7 @@ typedef struct {
     const uint8_t *seed; /* lane seed (SEEDBYTES)                      */
     uint16_t lane;       /* logical stream index 0..15                 */
     size_t pos, avail;   /* cursor into buf                            */
+    size_t fill_count;   /* number of XOF blocks already produced      */
     /* AVX N-way bulk source (ref leaves these 0 -> gs_fill always XOF).
      * When the AVX forks pre-fill K blocks N-at-a-time, gs_fill draws each
      * block from `bulk_ptr` (bulk_left counts the remaining pre-filled
@@ -225,11 +224,15 @@ static inline size_t gauss_bulk_k(uint8_t tag)
                                 : (size_t)BULK_K_EXPAND_S;
 }
 
-/* Tag-tuned per-squeeze block size (bytes drawn in one squeeze). */
-static inline size_t gauss_block_bytes(uint8_t tag)
+/* Tag- and fill-indexed per-squeeze block size.  SampleY uses the initial
+ * sign/padding/candidate block once, then 676-byte refill blocks; ExpandS
+ * remains fixed at one 392-byte block per fill. */
+static inline size_t gauss_block_bytes(uint8_t tag, size_t fill_index)
 {
-    return (tag == DS_SAMPLE_Y) ? (size_t)GAUSS_BLOCK_Y
-                                : (size_t)GAUSS_BLOCK_S;
+    if (tag == DS_SAMPLE_Y)
+        return (fill_index == 0) ? (size_t)GAUSS_BLOCK_Y
+                                 : (size_t)SAMPLE_Y_RAND_BYTES;
+    return (size_t)GAUSS_BLOCK_S;
 }
 
 void gauss_stream_init(gauss_stream *gs, uint8_t tag, const uint8_t *seed,

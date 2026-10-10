@@ -294,13 +294,14 @@ static uint64_t load_le64(const uint8_t *p)
 }
 
 int gauss_finalize(int32_t *out, int32_t x, int32_t y, uint64_t p_hat,
-                   const uint8_t tail[8], uint32_t sign_bit)
+                   const uint8_t tail[8], uint32_t sign_bit,
+                   uint32_t fold_bit)
 {
     int32_t cand = WIDE_K * x + y;                   /* 256x + y */
     uint64_t u = load_le64(tail);                    /* full 64-bit draw */
     uint32_t accept = (uint32_t)ct_lt_u64(u, p_hat); /* u < p_hat */
     uint32_t z0 = ct_is_zero_u32((uint32_t)cand);    /* cand == 0 */
-    uint32_t keep = accept & (1u ^ (z0 & (sign_bit & 1u)));
+    uint32_t keep = accept & (1u ^ (z0 & (fold_bit & 1u)));
     *out = ct_sel_i32(sign_bit & 1u, -cand, cand);
     return (int)keep;
 }
