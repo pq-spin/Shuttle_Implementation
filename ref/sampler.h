@@ -15,9 +15,8 @@
  * It does NOT own: the wide-sampler uniform-y / ApproxExp Bernoulli
  * accept, the keygen vector loop that consumes the magnitudes, nor the
  * sign / zero-fold fold.  This file exposes only the RAW unsigned
- * magnitude scan; the caller does the +/- sign and the 1/2 zero-fold
- * rejection from a separate tail-byte field (see the contract in
- * sampler.c).
+ * magnitude scan; the caller supplies the output-indexed sign bit and the
+ * candidate-indexed fold bit to the finalizer (see sampler.c).
  *
  * The threshold tables themselves live in tools/rcdt_tables.h (the
  * @@AUTOGEN:rcdt@@ region emitted by tools/gen_rcdt.py) as `static const`
@@ -104,6 +103,10 @@ _Static_assert(CDT96_SAMPLE_BYTES == 12,
 #define MINIBATCH_RAND_BYTES             \
     (SIGMA_S_RAND_BYTES + Y_RAND_BYTES + \
      GAUSS_BATCH * GAUSS_RAND_BYTES) /* 672 */
+#define SAMPLE_Y_FOLD_BYTES (GAUSS_BATCH / 8)                  /* 4   */
+#define SAMPLE_Y_RAND_BYTES \
+    (MINIBATCH_RAND_BYTES + SAMPLE_Y_FOLD_BYTES)               /* 676 */
+#define SAMPLE_Y_PADDING_BYTES 8
 _Static_assert(SIGMA_S_RAND_BYTES == SIGMA2_RAND_BYTES,
                "SIGMA_S_RAND_BYTES must equal SIGMA2_RAND_BYTES (same "
                "12-byte rho_u limb layout as the noise sampler)");
@@ -226,26 +229,23 @@ void noise_magnitude_batch(int32_t *m_out, const uint8_t *rand,
 /* ===================================================================== *
  *  Wide-Gaussian per-candidate finalize (SampleDGauss step 5-8)         *
  *                                                                       *
- *  Combines the BaseSampler magnitude x, the uniform low byte y, the    *
- *  Q64 ApproxExp accept threshold p_hat, the 8-byte (full 64-bit)       *
- *  Bernoulli tail u, and the OUTPUT-indexed magnitude sign bit into the *
- *  signed wide-Gaussian coefficient (or a rejection).  Branchless apart *
- *  from the (PUBLIC, masking-sampler) accept count.  Returns the {0,1}  *
- *  accept flag; on accept *out holds (-1)^sign * (WIDE_K*x + y).        *
+ *  Combines the BaseSampler magnitude x, the uniform low byte y, the
+ *  Q64 ApproxExp accept threshold p_hat, the 8-byte (full 64-bit)
+ *  Bernoulli tail u, the OUTPUT-indexed sign bit, and the independent
+ *  candidate-indexed fold bit into the signed wide-Gaussian coefficient
+ *  (or a rejection).  Returns the {0,1} accept flag; on accept *out holds
+ *  (-1)^sign * (WIDE_K*x + y).
  *                                                                       *
  *  Byte schedule pinned: u is the FULL 64-bit little-endian             *
  *  value of the 8-byte tail; accept iff u < p_hat (spec step 5/6, scale *
- *  2^64).  The z==0 zero-fold (spec step 7) is realized WITHOUT an extra *
- *  byte: a z==0 candidate is kept only when its OUTPUT sign bit is 0     *
- *  (one of the two identical-value signs of 0), halving the 0 mass.     *
- *  Since z==0 forces p_hat ~= 2^64-1 (exp(0)), the Bernoulli accept is   *
- *  ~always true there, so the sign-bit fold is effectively independent  *
- *  of u -- mass-correct to the ApproxExp rel-err (~2^-54).  This keeps   *
- *  the per-candidate tail at exactly GAUSS_RAND_BYTES = 8 (fixed-size,   *
- *  the consumed-bytes determinism rule) and the magnitude sign           *
- *  OUTPUT-indexed. */
+ *  2^64).  The z==0 zero-fold is independent: keep iff (u < p_hat) and
+ *  not (z == 0 and fold_bit == 1).  The per-candidate tail remains exactly
+ *  GAUSS_RAND_BYTES = 8; the fold bits for one mini-batch are appended as
+ *  SAMPLE_Y_FOLD_BYTES after the 672-byte candidate body.  The output sign
+ *  remains OUTPUT-indexed and cannot influence acceptance. */
 int gauss_finalize(int32_t *out, int32_t x, int32_t y, uint64_t p_hat,
-                   const uint8_t tail[8], uint32_t sign_bit);
+                   const uint8_t tail[8], uint32_t sign_bit,
+                   uint32_t fold_bit);
 
 /* ===================================================================== *
  *  Vectorized SIGN-INDEPENDENT gauss finalize precompute (SIMD only)     *

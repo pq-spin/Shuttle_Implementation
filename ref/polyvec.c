@@ -34,11 +34,10 @@
  * (RCDT_NOISE_E).* SampleC            : nonce 0x07 || seedC || LE16(0);
  * single init     * per draw REPEAT{ BN bytes; j = LE & (2^DN-1) }     *
  *                      UNTIL j <= i. * SampleY (per lane) : nonce 0x08 ||
- * seedY || LE16(t); single init    * per poly: SIGN_BYTES_PER_POLY
- * up-front sign bits,  * then mini-batches of GAUSS_BATCH candidates: *
- *                      384-byte rho_u (cdt_scan96 RCDT_Z) + 32-byte y + *
- *                      256-byte (32x8) Bernoulli tails, whole tail up *
- *                      front; accept via gauss_finalize. *
+ * seedY || LE16(t); single init    * per poly: output-indexed sign bits,
+ *                      8-byte padding, then 676-byte candidate batches;
+ *                      the final 4 bytes of each batch carry independent
+ *                      candidate-indexed fold bits. *
  */
 #include "polyvec.h"
 
@@ -324,24 +323,26 @@ void gauss_stream_init(gauss_stream *gs, uint8_t tag, const uint8_t *seed,
     gs->bulk_ptr = NULL; /* ref: always XOF, no N-way bulk source */
     gs->bulk_left = 0;
     gs->ff_blocks = 0;
+    gs->fill_count = 0;
     nonce[0] = tag;
     memcpy(nonce + 1, seed, seedlen);
     put_le16(nonce + 1 + seedlen, gs->lane);
     xof256_init(&gs->ctx, nonce, 1 + seedlen + 2);
 }
 
-/* Draw one gauss_block_bytes block in ONE xof256 squeeze off the persisted
+/* Draw one tag/fill-sized block in ONE xof256 squeeze off the persisted
  * gs->ctx, appending after any leftover already memmoved to the front of
  * buf.  Under NGCC each squeeze is one SM3 Generate (V advances one step);
  * the fixed block size is what keeps ref and the AVX forks byte-exact. */
 static void gs_fill(gauss_stream *gs)
 {
-    size_t blk = gauss_block_bytes(gs->tag);
+    size_t blk = gauss_block_bytes(gs->tag, gs->fill_count);
 #ifdef MEASURE_JK
     shuttle_jk_blocks++;
 #endif
     xof256_squeeze(&gs->ctx, gs->buf + gs->avail, blk);
     gs->avail += blk;
+    gs->fill_count++;
 }
 
 void gs_ensure(gauss_stream *gs, size_t need)
@@ -491,135 +492,66 @@ void sample_c(poly *c, const uint8_t seedC[CHALLENGESEEDBYTES])
  *        - y[32] = buf[pos..pos+32]   (advance 32; Y_BITS=8 byte copy)
  *        - p_hat[32] via approx_exp_accept_q64_x4 (8 groups of 4)
  *        - per-candidate gauss_finalize, tail at buf+pos+8*j (advance 256)
- *      The whole MINIBATCH_RAND_BYTES is consumed up front. */
+ *      The whole SAMPLE_Y_RAND_BYTES is consumed up front. */
 void gauss_stream_chunk(gauss_stream *gs, int32_t *dst, size_t count)
 {
     uint8_t signs[SIGN_BYTES_PER_CHUNK + SIGN_PAD_AVX512];
     size_t signbytes = (count + 7) / 8;
     size_t coefcnt = 0;
+    const uint32_t dummy = (uint32_t)(count - (count != 0));
 
-    /* (1) up-front sign bits (one per OUTPUT sample in this chunk). */
-    memset(signs, 0,
-           sizeof(signs)); /* pad zero for the AVX512 LE64 window */
-    {
-        PROF_START(t_sh0);
-        gs_ensure(gs, signbytes);
-        PROF_STOP(PT_G_SHAKE, t_sh0);
-    }
+    /* Initial SampleY block: output-indexed signs, fixed padding, then the
+     * first candidate batch.  The padding keeps the 64-bit candidate reads
+     * aligned with the NGCC algorithm's explicit beta_Y layout. */
+    memset(signs, 0, sizeof(signs));
+    gs_ensure(gs, GAUSS_BLOCK_Y);
     memcpy(signs, gs->buf + gs->pos, signbytes);
-    gs->pos += signbytes;
+    gs->pos += signbytes + SAMPLE_Y_PADDING_BYTES;
 
-    /* (2) wide mini-batches. */
     while (coefcnt < count) {
         int32_t x[GAUSS_BATCH];
         int32_t yv[GAUSS_BATCH];
         uint64_t phat[GAUSS_BATCH];
-        const uint8_t *yp, *tailp;
+        const uint8_t *yp;
+        const uint8_t *tailp;
+        const uint8_t *foldp;
         int j;
 
-        {
-            PROF_START(t_sh);
-            gs_ensure(gs, MINIBATCH_RAND_BYTES);
-            PROF_STOP(PT_G_SHAKE, t_sh);
-        }
-        /* magnitude x via RCDT_Z (grouped 96B/8-sample layout) */
-        {
-            PROF_START(t_bs);
-            sampler_sigma2(x, gs->buf + gs->pos);
-            PROF_STOP(PT_G_BASESAMP, t_bs);
-        }
+        gs_ensure(gs, SAMPLE_Y_RAND_BYTES);
+        sampler_sigma2(x, gs->buf + gs->pos);
         yp = gs->buf + gs->pos + SIGMA_S_RAND_BYTES;
         for (j = 0; j < GAUSS_BATCH; j++)
-            yv[j] = (int32_t)yp[j]; /* Y_BITS=8: plain byte copy */
+            yv[j] = (int32_t)yp[j];
         tailp = gs->buf + gs->pos + SIGMA_S_RAND_BYTES + Y_RAND_BYTES;
-        /* Two-path body.  When more than a full GAUSS_BATCH accepts are
-         * still outstanding (count-coefcnt > GAUSS_BATCH) every one of the
-         * 32 candidates is needed, so we run the full window (approx_exp
-         * then finalize) -- byte-identical to before.  Otherwise this
-         * MIGHT be the last mini-batch: we fuse approx_exp +
-         * gauss_finalize candidate- major (groups of 4 for the x4
-         * approx_exp API) and BREAK the moment `count` accepts have
-         * landed, eliding the approx_exp / finalize for the unused tail of
-         * the GAUSS_BATCH window.  Both paths leave any candidate past
-         * `count` DISCARDED (the dst write was already `coefcnt <
-         * count`-gated), and the byte cursor always advances the WHOLE
-         * MINIBATCH_RAND_BYTES, so the per-lane byte schedule is byte-
-         * identical to processing all 32.  The break is on the PUBLIC
-         * accept- count (same data-dependence as the mini-batch count). */
-        if (count - coefcnt > (size_t)GAUSS_BATCH) {
-            /* ----- common path: every candidate needed ----- */
-            {
-                PROF_START(t_ae);
-                for (j = 0; j < GAUSS_BATCH; j += 4) {
-                    int xi[4], yi[4];
-                    uint64_t po[4];
-                    int g;
-                    for (g = 0; g < 4; g++) {
-                        xi[g] = (int)x[j + g];
-                        yi[g] = (int)yv[j + g];
-                    }
-                    approx_exp_accept_q64_x4(xi, yi, po);
-                    for (g = 0; g < 4; g++)
-                        phat[j + g] = po[g];
-                }
-                PROF_STOP(PT_G_APPROXEXP, t_ae);
+        foldp = gs->buf + gs->pos + MINIBATCH_RAND_BYTES;
+        for (j = 0; j < GAUSS_BATCH; j += 4) {
+            int xi[4], yi[4];
+            uint64_t po[4];
+            int g;
+            for (g = 0; g < 4; g++) {
+                xi[g] = (int)x[j + g];
+                yi[g] = (int)yv[j + g];
             }
-            {
-                PROF_START(t_fin);
-                for (j = 0; j < GAUSS_BATCH; j++) {
-                    int32_t r;
-                    uint32_t sgn;
-                    size_t idx = coefcnt; /* OUTPUT index of NEXT accept */
-                    sgn = (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                    if (gauss_finalize(
-                            &r, x[j], yv[j], phat[j],
-                            tailp + (size_t)j * GAUSS_RAND_BYTES, sgn))
-                        dst[coefcnt++] = r;
-                }
-                PROF_STOP(PT_G_FINAL, t_fin);
-            }
-        } else {
-            /* ----- last-batch path: fuse + break when `count` accepts
-             * land, group-of-4 granular (safe: keeps going across
-             * in-window rejections until count is reached, up to the full
-             * GAUSS_BATCH). ----- */
-            for (j = 0; j < GAUSS_BATCH && coefcnt < count; j += 4) {
-                int xi[4], yi[4];
-                uint64_t po[4];
-                int g;
-                {
-                    PROF_START(t_ae);
-                    for (g = 0; g < 4; g++) {
-                        xi[g] = (int)x[j + g];
-                        yi[g] = (int)yv[j + g];
-                    }
-                    approx_exp_accept_q64_x4(xi, yi, po);
-                    for (g = 0; g < 4; g++)
-                        phat[j + g] = po[g];
-                    PROF_STOP(PT_G_APPROXEXP, t_ae);
-                }
-                {
-                    PROF_START(t_fin);
-                    for (g = 0; g < 4; g++) {
-                        int32_t r;
-                        uint32_t sgn;
-                        size_t idx =
-                            coefcnt; /* OUTPUT idx of NEXT accept */
-                        sgn =
-                            (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                        if (gauss_finalize(
-                                &r, x[j + g], yv[j + g], phat[j + g],
-                                tailp + (size_t)(j + g) * GAUSS_RAND_BYTES,
-                                sgn)) {
-                            if (coefcnt < count)
-                                dst[coefcnt++] = r;
-                        }
-                    }
-                    PROF_STOP(PT_G_FINAL, t_fin);
-                }
-            }
+            approx_exp_accept_q64_x4(xi, yi, po);
+            for (g = 0; g < 4; g++)
+                phat[j + g] = po[g];
         }
-        gs->pos += MINIBATCH_RAND_BYTES; /* WHOLE tail consumed */
+        /* Always consume and evaluate the complete fixed mini-batch.  Once
+         * the output is full, d selects the last real sign bit as a dummy;
+         * no secret-dependent or out-of-range sign read is performed. */
+        for (j = 0; j < GAUSS_BATCH; j++) {
+            int32_t r;
+            uint32_t done = ct_is_zero_u32((uint32_t)(count - coefcnt));
+            uint32_t d = (uint32_t)ct_sel_i32(
+                done, (int32_t)dummy, (int32_t)coefcnt);
+            uint32_t sgn = (uint32_t)(signs[d >> 3] >> (d & 7)) & 1u;
+            uint32_t fold = (uint32_t)(foldp[j >> 3] >> (j & 7)) & 1u;
+            if (gauss_finalize(&r, x[j], yv[j], phat[j],
+                               tailp + (size_t)j * GAUSS_RAND_BYTES,
+                               sgn, fold) && coefcnt < count)
+                dst[coefcnt++] = r;
+        }
+        gs->pos += SAMPLE_Y_RAND_BYTES;
     }
 }
 

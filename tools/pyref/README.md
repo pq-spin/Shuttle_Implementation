@@ -17,7 +17,7 @@ byte-for-byte equal. A divergence is a bug.
 | `drng_ref.py` | `ref/drng.c` | SM3 Hash-DRBG (`init/get_random_number`); SM3("abc") KAT |
 | `rans_ref.py` | `ref/rans.c` (via `tools/rans.py`) | SHUTTLE block-plan rANS encode/decode + re-encode equality (K15) |
 | `sampler_ref.py` | `ref/sampler.c`, `ref/sampler_u.c` | `cdt_scan96` (96-bit 3x32 limb, borrow-fold), `sampler_u` (MSB-first 80-bit CLZ + 57-bit mantissa + Q62 ApproxLog) |
-| `gauss_ref.py` | `ref/approx_exp.h`, `ref/sampler.c`, `ref/polyvec.c` | ApproxExp Q64 kernel (deg-8 Horner + 7 squarings), `gauss_finalize` zero-fold, the SampleY/ExpandS mini-batch byte schedule (up-front sign/tail blocks, K6/K8/K9) |
+| `gauss_ref.py` | `ref/approx_exp.h`, `ref/sampler.c`, `ref/polyvec.c` | ApproxExp Q64 kernel (deg-8 Horner + 7 squarings), `gauss_finalize` zero-fold, the SampleY/ExpandS mini-batch byte schedule (sign/padding prefix plus fold bytes, K6/K8/K9) |
 | `rounding_ref.py` | `ref/rounding.c` | CompressY/StretchS/RoundB, mod-2q lift (K13), MakeHint/UseHint, `mat_mul_2q`/`mat_mul_z1_2q` (NTT-domain), the centered-sqnorm gates |
 | `irs_ref.py` | `ref/irs.c`, `ref/sampler_u.c` | `sampler_u_decode` (18-byte block), the `u_q44` form (2 r^2 ln2, K12), `R_transition` (sign-normalize + 15 boundary pairs), `reject_sample` (single bulk `tau*18` buffer, ascending-j, K2/K3/K5) |
 | `xof_ref.py` | `ref/symmetric.c`, `ref/xof.h`, `ref/polyvec.c` | the XOF layer (SHA3_MODE SHAKE128/256 via `hashlib`; NGCC_MODE SM3 DRBG) + the `uniform_stream`/`gauss_stream` one-squeeze-per-fill engines |
@@ -71,7 +71,7 @@ differed) from that commit until the realignment below.
 |---|---|---|---|
 | ExpandA (`UniformStream`) | `0x02` | `tag‖seedA‖LE16(lane)` | `UNIFORM_DRAW` = `ceil(2·(EM·n·(1+ELL)/16)·BQ → granularity)` |
 | ExpandS (`GaussStream`) | `0x03` | `tag‖seedsk‖LE16(lane)` | `GAUSS_BLOCK_S` = `NOISE_MINIBATCH_RAND_BYTES` |
-| SampleY (`GaussStream`) | `0x08` | `tag‖seedY‖LE16(lane)` | `GAUSS_BLOCK_Y` = `SIGN_BYTES_PER_CHUNK + 8 + MINIBATCH_RAND_BYTES` |
+| SampleY (`GaussStream`) | `0x08` | `tag‖seedY‖LE16(lane)` | first squeeze: sign bytes + 8 padding + 676; later squeezes: 676 (672-byte candidate body + 4 fold bytes) |
 | SampleC (inline) | `0x07` | `tag‖seedC‖LE16(0)` | `SAMPLEC_DRAW` = `ceil(TAU·BN·2 → granularity)` |
 
 `granularity` is `XOF_SQUEEZE_GRANULARITY_BYTES` (SHAKE128 rate 168 under

@@ -50,12 +50,12 @@ class Shuttle:
         # EXACT minimum holding one logical unit -- no granularity rounding,
         # no +64 slack.  Tag-tuned:
         #   SampleY (tag 0x08): GAUSS_BLOCK_Y =
-        #       SIGN_BYTES_PER_CHUNK + SIGN_PAD_AVX512(8) + MINIBATCH(672)
+        #       SIGN_BYTES_PER_CHUNK + 8-byte padding + SAMPLE_Y_RAND(676)
         #   ExpandS (tag 0x03): GAUSS_BLOCK_S = NOISE_MINIBATCH_RAND_BYTES(392)
         kvecn_16 = self.p["KVEC"] * self.p["N"] // 16
         self.SIGN_BYTES_PER_CHUNK = (kvecn_16 + 7) // 8
         self.GAUSS_BLOCK_Y = (self.SIGN_BYTES_PER_CHUNK + 8
-                              + MINIBATCH_RAND_BYTES)
+                              + MINIBATCH_RAND_BYTES + 4)
         self.GAUSS_BLOCK_S = NOISE_MINIBATCH_RAND_BYTES
 
     # ---- XOF helpers ----
@@ -178,7 +178,8 @@ class Shuttle:
         Z = self._rcdt["Z"]
         for t in range(16):
             gs = xof_ref.GaussStream(self.sha3, 0x08, seedY, t,
-                                     self.GAUSS_BLOCK_Y)
+                                     self.GAUSS_BLOCK_Y,
+                                     MINIBATCH_RAND_BYTES + 4)
             chunk = gauss_chunk(gs, wy, Z)
             for i in range(wy):
                 ybar[t * wy + i] = chunk[i]

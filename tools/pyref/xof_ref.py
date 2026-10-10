@@ -158,15 +158,17 @@ class UniformStream:
 class GaussStream:
     """Mirror ref/polyvec.c gauss_stream + gs_fill/gs_ensure.  ONE xof256
     init with nonce = tag||seed||LE16(lane), then every block is one more
-    squeeze of gauss_block_bytes(tag) bytes off the SAME persisted ctx; the
+    squeeze of the fill-indexed gauss block bytes off the SAME persisted ctx; the
     buffer is a persistent byte array the ensure() memmoves the leftover of."""
 
-    def __init__(self, mode_sha3, tag, seed, lane, block):
+    def __init__(self, mode_sha3, tag, seed, lane, block, refill_block=None):
         self.mode_sha3 = mode_sha3
         self.tag = tag
         self.seed = bytes(seed)
         self.lane = lane
-        self.block = block               # gauss_block_bytes(tag)
+        self.block = block               # first gauss_block_bytes(tag)
+        self.refill_block = refill_block if refill_block is not None else block
+        self.fill_count = 0
         self.ctx = xof256_init(mode_sha3, self._nonce())
         self.buf = bytearray()
         self.pos = 0
@@ -177,11 +179,13 @@ class GaussStream:
 
     def _fill(self):
         # gs_fill: one more block squeeze appended after any leftover.
-        chunk = self.ctx.squeeze(self.block)
-        if len(self.buf) < self.avail + self.block:
-            self.buf.extend(bytes(self.avail + self.block - len(self.buf)))
-        self.buf[self.avail:self.avail + self.block] = chunk
-        self.avail += self.block
+        bsz = self.block if self.fill_count == 0 else self.refill_block
+        chunk = self.ctx.squeeze(bsz)
+        if len(self.buf) < self.avail + bsz:
+            self.buf.extend(bytes(self.avail + bsz - len(self.buf)))
+        self.buf[self.avail:self.avail + bsz] = chunk
+        self.avail += bsz
+        self.fill_count += 1
 
     def ensure(self, need):
         if self.avail - self.pos >= need:

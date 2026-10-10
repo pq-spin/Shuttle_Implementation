@@ -540,6 +540,7 @@ void gauss_stream_init(gauss_stream *gs, uint8_t tag, const uint8_t *seed,
     gs->bulk_ptr = NULL; /* scalar path: always XOF off gs->ctx */
     gs->bulk_left = 0;
     gs->ff_blocks = 0;
+    gs->fill_count = 0;
     nlen = gs_build_nonce(gs, nonce);
     xof256_init(&gs->ctx, nonce, nlen);
 }
@@ -552,12 +553,13 @@ void gauss_stream_init(gauss_stream *gs, uint8_t tag, const uint8_t *seed,
  *      ff_blocks blocks on the first fallback. */
 static void gs_fill(gauss_stream *gs)
 {
-    size_t blk = gauss_block_bytes(gs->tag);
+    size_t blk = gauss_block_bytes(gs->tag, gs->fill_count);
     if (gs->bulk_left) {
         memcpy(gs->buf + gs->avail, gs->bulk_ptr, blk);
         gs->bulk_ptr += blk;
         gs->bulk_left--;
         gs->avail += blk;
+        gs->fill_count++;
         return;
     }
     if (gs->ff_blocks) {
@@ -567,12 +569,14 @@ static void gs_fill(gauss_stream *gs)
         xof256_init(&gs->ctx, nonce, nlen);
         for (f = 0; f < gs->ff_blocks; f++) {
             uint8_t skip[GAUSS_STREAM_BLOCK];
-            xof256_squeeze(&gs->ctx, skip, blk);
+            size_t skip_len = gauss_block_bytes(gs->tag, f);
+            xof256_squeeze(&gs->ctx, skip, skip_len);
         }
         gs->ff_blocks = 0;
     }
     xof256_squeeze(&gs->ctx, gs->buf + gs->avail, blk);
     gs->avail += blk;
+    gs->fill_count++;
 }
 
 void gs_ensure(gauss_stream *gs, size_t need)
@@ -627,12 +631,14 @@ static void drng_copy_lane(xof_ctx *dst, const xof_ctx_avx512 *src,
  * to consume from its private region (with the V_K fallback ctx prepared).
  * Returns the malloc'd bulk buffer (caller frees) or NULL on OOM. */
 static uint8_t *gauss_bulk_setup(gauss_stream gss[XOF_STREAMS],
-                                 uint8_t tag, const uint8_t *seed,
-                                 size_t K)
+                                  uint8_t tag, const uint8_t *seed,
+                                  size_t K)
 {
     const size_t lanes = (size_t)XOF_LANES_AVX512;
     const size_t passes = (size_t)XOF_STREAMS / lanes;
-    size_t blk = gauss_block_bytes(tag);
+    const size_t first = gauss_block_bytes(tag, 0);
+    const size_t refill = gauss_block_bytes(tag, 1);
+    const size_t lane_bytes = first + (K > 1 ? (K - 1) * refill : 0);
     size_t seedlen = (tag == DS_SAMPLE_Y) ? SEEDBYTES : CHALLENGESEEDBYTES;
     size_t nlen = 1 + seedlen + 2;
     uint8_t nonces[XOF_STREAMS][1 + CHALLENGESEEDBYTES + 2];
@@ -640,7 +646,7 @@ static uint8_t *gauss_bulk_setup(gauss_stream gss[XOF_STREAMS],
     uint8_t *bulk;
     size_t i, p, k, t;
 
-    bulk = (uint8_t *)malloc((size_t)XOF_STREAMS * K * blk);
+    bulk = (uint8_t *)malloc((size_t)XOF_STREAMS * lane_bytes);
     if (!bulk)
         return NULL;
 
@@ -655,53 +661,48 @@ static uint8_t *gauss_bulk_setup(gauss_stream gss[XOF_STREAMS],
             seedp[k] = nonces[p * lanes + k];
         xof256_avx512_init(&nctx[p], seedp, nlen);
     }
-#    ifdef SHA3_MODE
-    /* SHA3: the scalar xof256_squeeze is rate-buffered/continuous (it
-     * tracks a leftover-rate cursor), so ref's K consecutive blk-squeezes
-     * == one continuous (K*blk)-squeeze.  The x8 squeeze, by contrast, is
-     * block-granular and DISCARDS the sub-rate tail of each call (blk is
-     * not a multiple of the SHAKE rate).  So issue ONE N-way squeeze of
-     * K*blk per lane (lane t's K blocks are contiguous in `bulk`): the
-     * only discarded tail is past the K*blk boundary, which the fallback
-     * re-derives via ff_blocks.  A per-block loop would wrongly drop every
-     * block's tail. */
+#ifdef SHA3_MODE
+    /* SHAKE is continuous across scalar squeezes; one lane-wide squeeze of
+     * the concatenated initial and refill blocks preserves that stream. */
     for (p = 0; p < passes; p++) {
         uint8_t *outp[XOF_LANES_AVX512];
         for (k = 0; k < lanes; k++)
-            outp[k] = bulk + (p * lanes + k) * K * blk;
-        xof256_avx512_squeeze(&nctx[p], outp, K * blk);
+            outp[k] = bulk + (p * lanes + k) * lane_bytes;
+        xof256_avx512_squeeze(&nctx[p], outp, lane_bytes);
     }
     (void)i;
-#    else
-    /* NGCC: each squeeze is one independent SM3 Generate advancing V
-     * exactly one step, matching ref's K separate gs_fill squeezes -- so
-     * issue K separate N-way squeezes (one big K*blk call would evolve V
-     * only once and diverge).  Squeeze i fills block i of every lane. */
-    for (i = 0; i < K; i++)
+#else
+    /* SM3 Hash-DRBG advances once per squeeze, so preserve the exact
+     * initial-then-refill call boundaries lane by lane. */
+    for (i = 0; i < K; i++) {
+        size_t blk = gauss_block_bytes(tag, i);
+        size_t off = (i == 0) ? 0 : first + (i - 1) * refill;
         for (p = 0; p < passes; p++) {
             uint8_t *outp[XOF_LANES_AVX512];
             for (k = 0; k < lanes; k++) {
                 t = p * lanes + k;
-                outp[k] = bulk + (t * K + i) * blk;
+                outp[k] = bulk + t * lane_bytes + off;
             }
             xof256_avx512_squeeze(&nctx[p], outp, blk);
         }
-#    endif
+    }
+#endif
     for (t = 0; t < XOF_STREAMS; t++) {
         gss[t].tag = tag;
         gss[t].seed = seed;
         gss[t].lane = (uint16_t)t;
         gss[t].pos = 0;
         gss[t].avail = 0;
-        gss[t].bulk_ptr = bulk + t * K * blk;
+        gss[t].fill_count = 0;
+        gss[t].bulk_ptr = bulk + t * lane_bytes;
         gss[t].bulk_left = K;
-#    ifdef SHA3_MODE
-        gss[t].ff_blocks = K; /* lazy re-init+fast-forward on overflow */
-#    else
+#ifdef SHA3_MODE
+        gss[t].ff_blocks = K;
+#else
         drng_copy_lane(&gss[t].ctx, &nctx[t / lanes],
                        (unsigned)(t % lanes));
         gss[t].ff_blocks = 0;
-#    endif
+#endif
     }
     return bulk;
 }
@@ -889,7 +890,7 @@ void sample_c(poly *c, const uint8_t seedC[CHALLENGESEEDBYTES])
  *  WHY (B) IS BYTE-EXACT TO (A) (consumed-bytes invariance):
  *  lane k's gauss_stream is the deterministic byte schedule
  *      xof256(0x08 || seedY || LE16(k) || LE16(refill)),  refill = 1,2,...
- *  consumed in a fixed sign-stream prefix + GAUSS_BATCH mini-batches with
+ *  consumed in a fixed sign/padding prefix + 676-byte GAUSS_BATCH mini-batches with
  * a fully-consumed-up-front tail (the cursor advances regardless of the
  * early coefcnt==count break).  Lane k consumes refills 1..R_k.  Both
  * paths use the IDENTICAL nonce schedule (gs_build_nonce) and the
@@ -923,170 +924,68 @@ static void gs_load_sign_stream(gauss_stream *gs, uint8_t *signs,
  * the EXACT scalar body extracted verbatim from gauss_stream_chunk,
  * shared by the scalar (A) and N-way (B) paths so they cannot diverge. */
 static void gs_consume_minibatch(gauss_stream *gs, int32_t *dst,
-                                 size_t *coefcnt, size_t count,
-                                 const uint8_t *signs)
+                                  size_t *coefcnt, size_t count,
+                                  const uint8_t *signs)
 {
     int32_t x[GAUSS_BATCH];
     int32_t yv[GAUSS_BATCH];
     uint64_t phat[GAUSS_BATCH];
-    const uint8_t *yp, *tailp;
+    const uint8_t *yp, *tailp, *foldp;
+    const uint32_t dummy = (uint32_t)(count - (count != 0));
     int j;
 
-    {
-        PROF_START(t_bs);
-        sampler_sigma2(x, gs->buf + gs->pos);
-        PROF_STOP(PT_G_BASESAMP, t_bs);
-    }
+    sampler_sigma2(x, gs->buf + gs->pos);
     yp = gs->buf + gs->pos + SIGMA_S_RAND_BYTES;
     for (j = 0; j < GAUSS_BATCH; j++)
-        yv[j] = (int32_t)yp[j]; /* Y_BITS=8: plain byte copy */
+        yv[j] = (int32_t)yp[j];
     tailp = gs->buf + gs->pos + SIGMA_S_RAND_BYTES + Y_RAND_BYTES;
-
-    /* Two-path body.  When more than a full GAUSS_BATCH accepts are still
-     * outstanding (count - *coefcnt > GAUSS_BATCH) every one of the 32
-     * candidates is needed -- coefcnt cannot reach count this mini-batch
-     * -- so we run the full-width SIMD path, byte-identical to before and
-     * with the common-case throughput unchanged.  Otherwise this MIGHT be
-     * the last mini-batch: we fuse approx_exp + finalize candidate-major
-     * in SIMD groups of 8 (the AVX-512 gauss_finalize_batch width) and
-     * BREAK the moment `count` accepts have landed, eliding the approx_exp
-     * / finalize for the unused tail of the GAUSS_BATCH window.  Both
-     * paths leave any candidate past `count` DISCARDED (the dst write was
-     * already
-     * `*coefcnt < count`-gated), and the byte cursor always advances the
-     * WHOLE MINIBATCH_RAND_BYTES, so the per-lane byte schedule is byte-
-     * identical to processing all 32.  The break is on the PUBLIC accept-
-     * count (same data-dependence as the mini-batch count). */
-    if (count - *coefcnt > (size_t)GAUSS_BATCH) {
-        /* ----- common path: every candidate needed, full-width SIMD -----
-         */
-        {
-            PROF_START(t_ae);
-            for (j = 0; j < GAUSS_BATCH; j += 4) {
-                int xi[4], yi[4];
-                uint64_t po[4];
-                int g;
-                for (g = 0; g < 4; g++) {
-                    xi[g] = (int)x[j + g];
-                    yi[g] = (int)yv[j + g];
-                }
-                approx_exp_accept_q64_x4(xi, yi, po);
-                for (g = 0; g < 4; g++)
-                    phat[j + g] = po[g];
-            }
-            PROF_STOP(PT_G_APPROXEXP, t_ae);
+    foldp = gs->buf + gs->pos + MINIBATCH_RAND_BYTES;
+    for (j = 0; j < GAUSS_BATCH; j += 4) {
+        int xi[4], yi[4];
+        uint64_t po[4];
+        int g;
+        for (g = 0; g < 4; g++) {
+            xi[g] = (int)x[j + g];
+            yi[g] = (int)yv[j + g];
         }
-        {
-            PROF_START(t_fin);
+        approx_exp_accept_q64_x4(xi, yi, po);
+        for (g = 0; g < 4; g++)
+            phat[j + g] = po[g];
+    }
 #if defined(USE_AVX512_SAMPLER) && defined(__AVX512F__) && \
     !defined(GAUSS_FINALIZE_SCALAR)
-            int32_t cand[GAUSS_BATCH], negcand[GAUSS_BATCH];
-            int32_t accept[GAUSS_BATCH], z0[GAUSS_BATCH];
-            gauss_finalize_batch(cand, negcand, accept, z0, x, yv, phat,
-                                 tailp, GAUSS_BATCH);
-            for (j = 0; j < GAUSS_BATCH; j++) {
-                size_t idx =
-                    *coefcnt; /* OUTPUT index of the NEXT accept */
-                uint32_t sgn =
-                    (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                uint32_t keep =
-                    (uint32_t)accept[j] & (1u ^ ((uint32_t)z0[j] & sgn));
-                if (keep)
-                    dst[(*coefcnt)++] = sgn ? negcand[j] : cand[j];
-            }
-#else
-            for (j = 0; j < GAUSS_BATCH; j++) {
-                int32_t r;
-                uint32_t sgn;
-                size_t idx =
-                    *coefcnt; /* OUTPUT index of the NEXT accept */
-                sgn = (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                if (gauss_finalize(&r, x[j], yv[j], phat[j],
-                                   tailp + (size_t)j * GAUSS_RAND_BYTES,
-                                   sgn))
-                    dst[(*coefcnt)++] = r;
-            }
-#endif
-            PROF_STOP(PT_G_FINAL, t_fin);
-        }
-    } else {
-        /* ----- last-batch path: cover the candidate window [base,32) in
-         * at most two WIDE SIMD passes, breaking the compaction once
-         * `count` accepts land.  The first pass spans the candidates we
-         * expect to need (remaining accepts rounded up to the 8-candidate
-         * SIMD group); the second pass (taken only if a rare in-window
-         * rejection left us short) covers the rest, so we NEVER
-         * under-process and force an extra mini-batch.  Eliding the tail
-         * of approx_exp / finalize past the window is what saves work;
-         * keeping ONE wide finalize_batch per pass keeps the per-candidate
-         * SIMD efficiency of the common path. Byte-exact: candidates are
-         * processed in order with the same per- candidate math and the
-         * same coefcnt progression as the full path. ----- */
-        size_t remain = count - *coefcnt;     /* >0, <= GAUSS_BATCH */
-        int win = (int)((remain + 7u) & ~7u); /* round up to SIMD group */
-        int base = 0;
-        if (win > GAUSS_BATCH)
-            win = GAUSS_BATCH;
-        while (base < GAUSS_BATCH && *coefcnt < count) {
-            int n = win - base;
-            int e = win;
-            {
-                PROF_START(t_ae);
-                for (j = base; j < e; j += 4) {
-                    int xi[4], yi[4];
-                    uint64_t po[4];
-                    int g;
-                    for (g = 0; g < 4; g++) {
-                        xi[g] = (int)x[j + g];
-                        yi[g] = (int)yv[j + g];
-                    }
-                    approx_exp_accept_q64_x4(xi, yi, po);
-                    for (g = 0; g < 4; g++)
-                        phat[j + g] = po[g];
-                }
-                PROF_STOP(PT_G_APPROXEXP, t_ae);
-            }
-            {
-                PROF_START(t_fin);
-#if defined(USE_AVX512_SAMPLER) && defined(__AVX512F__) && \
-    !defined(GAUSS_FINALIZE_SCALAR)
-                int32_t cand[GAUSS_BATCH], negcand[GAUSS_BATCH];
-                int32_t accept[GAUSS_BATCH], z0[GAUSS_BATCH];
-                gauss_finalize_batch(
-                    cand + base, negcand + base, accept + base, z0 + base,
-                    x + base, yv + base, phat + base,
-                    tailp + (size_t)base * GAUSS_RAND_BYTES, n);
-                for (j = base; j < e && *coefcnt < count; j++) {
-                    size_t idx =
-                        *coefcnt; /* OUTPUT index of NEXT accept */
-                    uint32_t sgn =
-                        (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                    uint32_t keep = (uint32_t)accept[j] &
-                                    (1u ^ ((uint32_t)z0[j] & sgn));
-                    if (keep)
-                        dst[(*coefcnt)++] = sgn ? negcand[j] : cand[j];
-                }
-#else
-                for (j = base; j < e && *coefcnt < count; j++) {
-                    int32_t r;
-                    uint32_t sgn;
-                    size_t idx =
-                        *coefcnt; /* OUTPUT index of NEXT accept */
-                    sgn = (uint32_t)(signs[idx >> 3] >> (idx & 7)) & 1u;
-                    if (gauss_finalize(
-                            &r, x[j], yv[j], phat[j],
-                            tailp + (size_t)j * GAUSS_RAND_BYTES, sgn))
-                        dst[(*coefcnt)++] = r;
-                }
-#endif
-                PROF_STOP(PT_G_FINAL, t_fin);
-            }
-            base = win;
-            win =
-                GAUSS_BATCH; /* second pass (if needed) covers the rest */
+    {
+        int32_t cand[GAUSS_BATCH], negcand[GAUSS_BATCH];
+        int32_t accept[GAUSS_BATCH], z0[GAUSS_BATCH];
+        gauss_finalize_batch(cand, negcand, accept, z0, x, yv, phat,
+                             tailp, GAUSS_BATCH);
+        for (j = 0; j < GAUSS_BATCH; j++) {
+            uint32_t done = ct_is_zero_u32((uint32_t)(count - *coefcnt));
+            uint32_t d = (uint32_t)ct_sel_i32(
+                done, (int32_t)dummy, (int32_t)*coefcnt);
+            uint32_t sgn = (uint32_t)(signs[d >> 3] >> (d & 7)) & 1u;
+            uint32_t fold = (uint32_t)(foldp[j >> 3] >> (j & 7)) & 1u;
+            uint32_t keep = (uint32_t)accept[j] &
+                            (1u ^ ((uint32_t)z0[j] & fold));
+            if (keep && *coefcnt < count)
+                dst[(*coefcnt)++] = sgn ? negcand[j] : cand[j];
         }
     }
-    gs->pos += MINIBATCH_RAND_BYTES; /* WHOLE tail consumed */
+#else
+    for (j = 0; j < GAUSS_BATCH; j++) {
+        int32_t r;
+        uint32_t done = ct_is_zero_u32((uint32_t)(count - *coefcnt));
+        uint32_t d = (uint32_t)ct_sel_i32(
+            done, (int32_t)dummy, (int32_t)*coefcnt);
+        uint32_t sgn = (uint32_t)(signs[d >> 3] >> (d & 7)) & 1u;
+        uint32_t fold = (uint32_t)(foldp[j >> 3] >> (j & 7)) & 1u;
+        if (gauss_finalize(&r, x[j], yv[j], phat[j],
+                           tailp + (size_t)j * GAUSS_RAND_BYTES,
+                           sgn, fold) && *coefcnt < count)
+            dst[(*coefcnt)++] = r;
+    }
+#endif
+    gs->pos += SAMPLE_Y_RAND_BYTES;
 }
 
 /* gauss_stream_chunk: scalar per-lane path (A) -- produce a flat run of
@@ -1104,15 +1003,16 @@ void gauss_stream_chunk(gauss_stream *gs, int32_t *dst, size_t count)
            sizeof(signs)); /* pad zero for the AVX512 LE64 window */
     {
         PROF_START(t_sh0);
-        gs_ensure(gs, signbytes);
+        gs_ensure(gs, GAUSS_BLOCK_Y);
         PROF_STOP(PT_G_SHAKE, t_sh0);
     }
     gs_load_sign_stream(gs, signs, signbytes);
+    gs->pos += SAMPLE_Y_PADDING_BYTES;
 
     while (coefcnt < count) {
         {
             PROF_START(t_sh);
-            gs_ensure(gs, MINIBATCH_RAND_BYTES);
+            gs_ensure(gs, SAMPLE_Y_RAND_BYTES);
             PROF_STOP(PT_G_SHAKE, t_sh);
         }
         gs_consume_minibatch(gs, dst, &coefcnt, count, signs);
